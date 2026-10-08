@@ -1,17 +1,17 @@
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket, SocketAddr};
-use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use rand::Rng;
+use parking_lot::Mutex;
 
 use streaming_quotes::quote::StockQuote;
-use streaming_quotes::protocol::{parse_command, format_ok, format_err};
+use streaming_quotes::protocol::{parse_command, format_ok, format_err, Command};
 use streaming_quotes::tickers::load_tickers;
 
 struct Subscriber {
-    tx: mpsc::Sender<StockQuote>,
+    tx: std::sync::mpsc::Sender<StockQuote>,
     udp_addr: SocketAddr,
     tickers: HashSet<String>,
     last_ping: Instant,
@@ -25,11 +25,11 @@ fn main() {
     let ping_port = args.get(2).map(|s| s.as_str()).unwrap_or("7879");
     let tickers_file = args.get(3).map(|s| s.as_str()).unwrap_or("assets/tickers.txt");
 
-    let valid_tickers = Arc::new(load_tickers(tickers_file).expect("Failed to load tickers"));
-    let subscribers: Arc<Mutex<Vec<Subscriber>>> = Arc::new(Mutex::new(Vec::new()));
+    let valid_tickers = std::sync::Arc::new(load_tickers(tickers_file).expect("Failed to load tickers"));
+    let subscribers: std::sync::Arc<Mutex<Vec<Subscriber>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
 
     // 1. Поток приёма PING
-    let ping_subs = Arc::clone(&subscribers);
+    let ping_subs = std::sync::Arc::clone(&subscribers);
     let ping_addr = format!("0.0.0.0:{}", ping_port);
     let ping_socket = UdpSocket::bind(&ping_addr).expect("Failed to bind ping socket");
     println!("[Server] PING listener started on {}", ping_addr);
@@ -40,7 +40,7 @@ fn main() {
             if let Ok((len, addr)) = ping_socket.recv_from(&mut buf) {
                 let msg = String::from_utf8_lossy(&buf[..len]);
                 if msg.trim() == "PING" {
-                    let mut subs = ping_subs.lock().unwrap();
+                    let mut subs = ping_subs.lock();
                     for sub in subs.iter_mut() {
                         if sub.udp_addr == addr {
                             sub.last_ping = Instant::now();
@@ -52,14 +52,14 @@ fn main() {
     });
 
     // 2. Поток генератора котировок
-    let gen_subs = Arc::clone(&subscribers);
-    let gen_valid_tickers = Arc::clone(&valid_tickers);
+    let gen_subs = std::sync::Arc::clone(&subscribers);
+    let gen_valid_tickers = std::sync::Arc::clone(&valid_tickers);
     thread::spawn(move || {
         let mut rng = rand::rng();
         let tickers_vec: Vec<String> = gen_valid_tickers.iter().cloned().collect();
 
         loop {
-            thread::sleep(Duration::from_millis(500)); // Генерация каждые 500мс
+            thread::sleep(Duration::from_millis(500));
             
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -80,12 +80,10 @@ fn main() {
                 timestamp_ms: now_ms,
             };
 
-            let mut subs = gen_subs.lock().unwrap();
+            let mut subs = gen_subs.lock();
             
-            // Очистка протухших подписок (тайм-аут PING)
             subs.retain(|sub| sub.last_ping.elapsed() < Duration::from_secs(PING_TIMEOUT_SEC));
 
-            // Рассылка только тем, у кого тикер в фильтре
             for sub in subs.iter() {
                 if sub.tickers.contains(&quote.ticker) {
                     let _ = sub.tx.send(quote.clone());
@@ -101,8 +99,8 @@ fn main() {
 
     for stream in listener.incoming() {
         let stream = stream.expect("Failed to accept connection");
-        let subs = Arc::clone(&subscribers);
-        let valid_tickers = Arc::clone(&valid_tickers);
+        let subs = std::sync::Arc::clone(&subscribers);
+        let valid_tickers = std::sync::Arc::clone(&valid_tickers);
 
         thread::spawn(move || {
             handle_client(stream, subs, valid_tickers);
@@ -112,11 +110,9 @@ fn main() {
 
 fn handle_client(
     stream: TcpStream,
-    subscribers: Arc<Mutex<Vec<Subscriber>>>,
-    valid_tickers: Arc<HashSet<String>>,
+    subscribers: std::sync::Arc<Mutex<Vec<Subscriber>>>,
+    valid_tickers: std::sync::Arc<HashSet<String>>,
 ) {
-    use streaming_quotes::protocol::Command; // Убедимся, что enum виден
-
     let mut reader = BufReader::new(stream);
     let mut cmd_str = String::new();
     
@@ -127,7 +123,7 @@ fn handle_client(
     let mut stream = reader.into_inner();
 
     match parse_command(&cmd_str) {
-        Ok(Command::Stream { udp_addr, tickers }) => { // <-- Правильная деструктуризация enum
+        Ok(Command::Stream { udp_addr, tickers }) => {
             let mut filter = HashSet::new();
             for t in &tickers {
                 if valid_tickers.contains(t) {
@@ -142,10 +138,10 @@ fn handle_client(
 
             let _ = stream.write_all(format_ok().as_bytes());
 
-            let (tx, rx) = mpsc::channel::<StockQuote>();
+            let (tx, rx) = std::sync::mpsc::channel::<StockQuote>();
 
             {
-                let mut subs = subscribers.lock().unwrap();
+                let mut subs = subscribers.lock();
                 subs.push(Subscriber {
                     tx,
                     udp_addr,
@@ -154,15 +150,14 @@ fn handle_client(
                 });
             }
 
-            // Поток отправки UDP для данного клиента
             let udp_socket = UdpSocket::bind("0.0.0.0:0").expect("Failed to bind ephemeral UDP socket");
             
             thread::spawn(move || {
-                // Когда генератор удалит подписчика, tx будет dropped, 
-                // и rx.recv() вернёт ошибку, завершив поток.
                 while let Ok(quote) = rx.recv() {
                     let line = format!("{}\n", quote.to_wire_line());
-                    let _ = udp_socket.send_to(line.as_bytes(), udp_addr);
+                    if let Err(e) = udp_socket.send_to(line.as_bytes(), udp_addr) {
+                        eprintln!("[Server] Failed to send quote to {}: {}", udp_addr, e);
+                    }
                 }
             });
         }

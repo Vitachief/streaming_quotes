@@ -23,19 +23,37 @@ pub fn load_tickers(path: &str) -> Result<HashSet<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
     use std::fs::File;
     use std::io::Write;
-    use tempfile::NamedTempFile;
 
     #[test]
     fn test_load_tickers() {
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, "AAPL\n  MSFT  \n\nTSLA").unwrap();
+        let temp_dir = env::temp_dir();
+        let file_path = temp_dir.join("test_tickers.txt");
         
-        let tickers = load_tickers(file.path().to_str().unwrap()).unwrap();
+        let mut file = File::create(&file_path).expect("Failed to create temp file");
+        writeln!(file, "AAPL\n  MSFT  \n\nTSLA").expect("Failed to write to temp file");
+        
+        let tickers = load_tickers(file_path.to_str().unwrap()).unwrap();
         assert_eq!(tickers.len(), 3);
         assert!(tickers.contains("AAPL"));
         assert!(tickers.contains("MSFT"));
         assert!(tickers.contains("TSLA"));
+        
+        let _ = fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn test_empty_tickers_file() {
+        let temp_dir = env::temp_dir();
+        let file_path = temp_dir.join("empty_tickers.txt");
+        File::create(&file_path).expect("Failed to create temp file");
+        
+        let result = load_tickers(file_path.to_str().unwrap());
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Ticker file is empty or contains no valid entries");
+        
+        let _ = fs::remove_file(&file_path);
     }
 }
